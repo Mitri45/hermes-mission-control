@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""Minimal Pi telemetry server for Mission Control.
+
+Exposes read-only status JSON for the PC dashboard without running the full
+Mission Control FastAPI app on the Pi.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import psutil
+from cron.jobs import (
+    get_job as scheduler_get_job,
+    list_jobs as scheduler_list_jobs,
+    pause_job as scheduler_pause_job,
+    resume_job as scheduler_resume_job,
+    trigger_job as scheduler_trigger_job,
+    update_job as scheduler_update_job,
+)
+from cron.scheduler import tick as scheduler_tick
+
+
+def _digest_storage_path() -> Path:
+    """Return the Pi digest storage directory."""
+    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+    return hermes_home / "mission-control" / "digests"
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+
+
+def _cron_output_dir() -> Path:
+    return _hermes_home() / "cron" / "output"
+
+
+def _entries_file() -> Path:
+    return _digest_storage_path() / "entries.jsonl"
+
+
+def _extract_response_content(text: str) -> str | None:
+    parts = re.split(r"^## Response\s*$", text, maxsplit=1, flags=re.MULTILINE)
+    if len(parts) >= 2:
+        content = parts[1].strip()
+        return content or None
+    content = text.strip()
+    return content or None
+
+
+def _hydrate_digest_entry(entry: dict[str, object]) -> dict[str, object]:
+    if entry.get("content"):
+        return entry
+    metadata = entry.get("metadata")
+    if not isinstance(metadata, dict):
+        return entry
+    output_file = metadata.get("output_file")
+    if not isinstance(output_file, str) or not output_file.strip():
+        return entry
+    path = Path(output_file).expanduser()
+    try:
+        content = _extract_response_content(path.read_text(encoding="utf-8"))
+    except OSError:
+        return entry
+    if not content:
+        return entry
+    hydrated = dict(entry)
+    hydrated["content"] = content
+    return hydrated
+
+
+def _normalized_digest_summary(entry: dict[str, object]) -> str:
+    summary = " ".join(str(entry.get("summary") or "").strip().split()).lower()
+    return summary
+
+
+def _is_low_signal_digest_entry(entry: dict[str, object]) -> bool:
+    summary = _normalized_digest_summary(entry)
+    return summary in {"", "---"} or summary.startswith("silent")
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    """Parse an ISO datetime into UTC."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_digest_entries() -> list[dict[str, object]]:
+    """Read digest entries from local Pi storage."""
+    entries: list[dict[str, object]] = []
+    path = _entries_file()
+    if not path.exists():
+        return entries
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        entries.append(entry)
+    return entries
+
+
+def _filter_digest_entries(
+    entries: list[dict[str, object]],
+    *,
+    instance_filter: str = "all",
+    source_filter: str | None = None,
+    days: int | None = None,
+) -> list[dict[str, object]]:
+    """Filter and sort digest entries for list/stats endpoints."""
+    filtered: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    date_threshold = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+
+    for entry in sorted(
+        entries,
+        key=lambda item: _parse_iso_datetime(str(item.get("ingested_at") or "")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    ):
+        if _is_low_signal_digest_entry(entry):
+            continue
+        source_instance = str(entry.get("source_instance") or "")
+        source = str(entry.get("source") or "")
+        ingested_at = _parse_iso_datetime(str(entry.get("ingested_at") or ""))
+        title = str(entry.get("title") or "").strip().lower()
+        normalized_summary = _normalized_digest_summary(entry)
+
+        if instance_filter != "all" and source_instance != instance_filter:
+            continue
+        if source_filter and source != source_filter:
+            continue
+        if date_threshold and (ingested_at is None or ingested_at < date_threshold):
+            continue
+        if ingested_at is None:
+            continue
+
+        dedupe_key = (
+            source_instance,
+            source,
+            title,
+            normalized_summary,
+            ingested_at.strftime("%Y-%m-%d"),
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        filtered.append(entry)
+    return filtered
+
+
+def build_digest_list_payload(
+    *,
+    instance_filter: str = "all",
+    source_filter: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    days: int | None = None,
+) -> dict[str, object]:
+    """Return a digest list payload compatible with Mission Control."""
+    filtered = _filter_digest_entries(
+        _load_digest_entries(),
+        instance_filter=instance_filter,
+        source_filter=source_filter,
+        days=days,
+    )
+    total = len(filtered)
+    start_idx = max(0, (page - 1) * page_size)
+    end_idx = start_idx + page_size
+    paginated = filtered[start_idx:end_idx]
+
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for entry in paginated:
+        ingested_at = str(entry.get("ingested_at") or "")
+        day_key = ingested_at[:10] if len(ingested_at) >= 10 else "unknown"
+        grouped[day_key].append(entry)
+
+    groups = [
+        {"date": date, "entries": entries, "count": len(entries)}
+        for date, entries in sorted(grouped.items(), reverse=True)
+    ]
+
+    return {
+        "entries": paginated,
+        "groups": groups,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_more": end_idx < total,
+    }
+
+
+def build_digest_stats_payload(*, instance_filter: str = "all") -> dict[str, object]:
+    """Return digest stats payload compatible with Mission Control."""
+    entries = _filter_digest_entries(_load_digest_entries(), instance_filter=instance_filter)
+    now = datetime.now(timezone.utc)
+    by_source: dict[str, int] = defaultdict(int)
+    by_instance: dict[str, int] = defaultdict(int)
+    last_24h = 0
+    last_7d = 0
+    replication_lags: list[float] = []
+
+    for entry in entries:
+        source = str(entry.get("source") or "")
+        source_instance = str(entry.get("source_instance") or "")
+        ingested_at = _parse_iso_datetime(str(entry.get("ingested_at") or ""))
+        replicated_at = _parse_iso_datetime(str(entry.get("replicated_at") or ""))
+        if source:
+            by_source[source] += 1
+        if source_instance:
+            by_instance[source_instance] += 1
+        if ingested_at and ingested_at > now - timedelta(hours=24):
+            last_24h += 1
+        if ingested_at and ingested_at > now - timedelta(days=7):
+            last_7d += 1
+        if ingested_at and replicated_at:
+            replication_lags.append((replicated_at - ingested_at).total_seconds())
+
+    return {
+        "total_entries": len(entries),
+        "by_source": dict(by_source),
+        "by_instance": dict(by_instance),
+        "last_24h": last_24h,
+        "last_7d": last_7d,
+        "replication_lag_seconds": (sum(replication_lags) / len(replication_lags)) if replication_lags else None,
+    }
+
+
+def build_digest_detail_payload(entry_id: str) -> dict[str, object] | None:
+    """Return a single digest detail payload when present."""
+    for entry in _load_digest_entries():
+        if str(entry.get("id") or "") == entry_id:
+            return {"entry": _hydrate_digest_entry(entry)}
+    return None
+
+
+def _normalize_cron_job(job: dict[str, object], *, default_instance: str = "pi") -> dict[str, object]:
+    """Normalize scheduler jobs into the Mission Control cron schema."""
+    schedule_value = job.get("schedule")
+    schedule_display = job.get("schedule_display")
+    if isinstance(schedule_display, str) and schedule_display.strip():
+        schedule = schedule_display.strip()
+    elif isinstance(schedule_value, dict):
+        schedule = str(schedule_value.get("display") or schedule_value.get("expr") or "").strip()
+    else:
+        schedule = str(schedule_value or "").strip()
+
+    state = str(job.get("state") or "paused").strip().lower()
+    if state == "scheduled":
+        status = "scheduled"
+    elif state in {"active", "paused", "running", "error"}:
+        status = state
+    else:
+        status = "paused"
+
+    enabled = bool(job.get("enabled", True))
+    if not enabled and status == "scheduled":
+        status = "paused"
+
+    last_status = str(job.get("last_status") or "").strip().lower()
+    if last_status == "ok":
+        last_result = "success"
+    elif last_status in {"failed", "error"}:
+        last_result = "failed"
+    elif last_status:
+        last_result = "triggered"
+    else:
+        last_result = None
+
+    failure_reason = job.get("last_error") or job.get("last_delivery_error")
+    instance = str(job.get("instance") or default_instance)
+    if instance not in {"pc", "pi", "both"}:
+        instance = default_instance
+
+    return {
+        "id": str(job.get("id") or ""),
+        "name": str(job.get("name") or ""),
+        "schedule": schedule,
+        "status": status,
+        "enabled": enabled,
+        "target": str(job.get("deliver") or job.get("target") or "local"),
+        "instance": instance,
+        "last_result": last_result,
+        "last_run": job.get("last_run_at"),
+        "next_run": job.get("next_run_at"),
+        "runtime_seconds": None,
+        "failure_reason": failure_reason,
+        "failure_count": 1 if last_result == "failed" else 0,
+    }
+
+
+def build_cron_jobs_payload(*, instance_filter: str = "all") -> dict[str, object]:
+    """Return cron jobs from the real Pi scheduler store."""
+    jobs = [
+        _normalize_cron_job(job, default_instance="pi")
+        for job in scheduler_list_jobs(include_disabled=True)
+    ]
+    if instance_filter != "all":
+        jobs = [job for job in jobs if job.get("instance") in {instance_filter, "both"}]
+    return {"jobs": jobs}
+
+
+def _recent_job_logs(job_id: str, lines: int) -> list[str]:
+    """Return recent saved markdown lines for a job."""
+    job_output_dir = _cron_output_dir() / job_id
+    if not job_output_dir.exists():
+        return []
+
+    collected: list[str] = []
+    for log_file in sorted(job_output_dir.glob("*.md"), reverse=True):
+        try:
+            file_lines = log_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        if not file_lines:
+            continue
+        collected = file_lines + collected
+        if len(collected) >= lines:
+            break
+    if lines <= 0:
+        return collected
+    return collected[-lines:]
+
+
+def build_job_logs_payload(job_id: str, *, lines: int = 50) -> dict[str, object]:
+    """Return recent logs for a Pi cron job."""
+    if scheduler_get_job(job_id) is None:
+        raise KeyError(job_id)
+    return {
+        "success": True,
+        "job_id": job_id,
+        "logs": _recent_job_logs(job_id, lines),
+    }
+
+
+def _apply_cron_action(job_id: str, action: str) -> dict[str, object]:
+    """Execute a cron control action against the real Pi scheduler."""
+    if action == "pause":
+        result = scheduler_pause_job(job_id)
+    elif action == "resume":
+        result = scheduler_resume_job(job_id)
+    elif action in {"run", "retry"}:
+        result = scheduler_trigger_job(job_id)
+        if result is not None:
+            threading.Thread(
+                target=scheduler_tick,
+                kwargs={"verbose": False},
+                daemon=True,
+                name=f"cron-trigger-{job_id}",
+            ).start()
+    else:
+        raise ValueError(f"Unsupported action: {action}")
+
+    if result is None:
+        raise KeyError(job_id)
+    return {"success": True, "message": f"Job {job_id} {action} requested"}
+
+
+def _build_schedule_update(schedule: str) -> dict[str, object]:
+    return {
+        "schedule": {"kind": "cron", "expr": schedule, "display": schedule},
+        "schedule_display": schedule,
+    }
+
+
+def apply_job_update(job_id: str, payload: dict[str, object]) -> dict[str, object]:
+    """Apply editable cron job fields to the real Pi scheduler."""
+    updates: dict[str, object] = {}
+    if "name" in payload:
+        updates["name"] = payload.get("name")
+    if "schedule" in payload and isinstance(payload.get("schedule"), str):
+        updates.update(_build_schedule_update(str(payload["schedule"])))
+    if "enabled" in payload:
+        enabled = bool(payload.get("enabled"))
+        updates["enabled"] = enabled
+        updates["state"] = "scheduled" if enabled else "paused"
+    if "target" in payload:
+        updates["deliver"] = payload.get("target")
+    if "instance" in payload:
+        updates["instance"] = payload.get("instance")
+
+    result = scheduler_update_job(job_id, updates)
+    if result is None:
+        raise KeyError(job_id)
+    return {"success": True, "message": f"Job {job_id} updated"}
+
+
+def _systemd_service_status(*unit_names: str) -> tuple[str, int | None]:
+    """Return service status/pid from systemd when available."""
+    for unit_name in unit_names:
+        try:
+            result = subprocess.run(
+                ["systemctl", "show", unit_name, "--property=MainPID,ActiveState", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+
+        if result.returncode != 0:
+            continue
+
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        if len(lines) < 2:
+            continue
+
+        main_pid, active_state = lines[0], lines[1]
+        if active_state == "active":
+            pid = int(main_pid) if main_pid.isdigit() and int(main_pid) > 0 else None
+            return "running", pid
+        if active_state:
+            return "stopped", None
+
+    return "unknown", None
+
+
+def _listening_pid(port: int) -> int | None:
+    """Return the pid listening on a given TCP port when present."""
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.status == "LISTEN" and conn.laddr.port == port:
+                return conn.pid
+    except Exception:
+        pass
+    return None
+
+
+def get_cpu_temp() -> float | None:
+    """Get CPU temperature with Raspberry Pi-specific probes first."""
+    try:
+        result = subprocess.run(
+            ["vcgencmd", "measure_temp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            temp_str = result.stdout.strip().replace("temp=", "").replace("'C", "")
+            return float(temp_str)
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+        pass
+
+    try:
+        thermal_zones = list(Path("/sys/class/thermal").glob("thermal_zone*/temp"))
+        temps: list[float] = []
+        for zone in thermal_zones:
+            try:
+                temps.append(int(zone.read_text().strip()) / 1000.0)
+            except (ValueError, OSError):
+                continue
+        if temps:
+            return sum(temps) / len(temps)
+    except Exception:
+        pass
+
+    return None
+
+
+def get_service_status(name: str, port: int | None = None) -> dict[str, object]:
+    """Return a simple service status row."""
+    pid = None
+    status = "stopped"
+
+    try:
+        if name == "gateway":
+            status, pid = _systemd_service_status("gateway.service")
+            if status == "running":
+                return {
+                    "name": name,
+                    "status": status,
+                    "port": port,
+                    "pid": pid,
+                }
+            for proc in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    cmdline = " ".join(proc.info.get("cmdline") or [])
+                    if "gateway" in cmdline and "python" in cmdline:
+                        pid = proc.info["pid"]
+                        status = "running"
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        elif name == "matrixbridge":
+            status, pid = _systemd_service_status(
+                "matrix_bridge.service",
+                "matrixbridge.service",
+                "matrix-bridge.service",
+            )
+            if status != "running" and port is not None:
+                pid = _listening_pid(port)
+                if pid:
+                    status = "running"
+        else:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    proc_name = (proc.info.get("name") or "").lower()
+                    if name.lower() in proc_name:
+                        pid = proc.info["pid"]
+                        status = "running"
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+    except Exception:
+        pass
+
+    return {
+        "name": name,
+        "status": status,
+        "port": port,
+        "pid": pid,
+    }
+
+
+def get_tailscale_status() -> dict[str, object]:
+    """Return Tailscale info if available."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            self_data = data.get("Self", {})
+            capabilities = str(self_data.get("Capabilities", []))
+            addrs = self_data.get("TailAddrs", [])
+            return {
+                "funnel": "funnel" in capabilities,
+                "hostname": self_data.get("HostName", ""),
+                "ip": addrs[0] if addrs else None,
+            }
+    except (subprocess.SubprocessError, FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    return {
+        "funnel": False,
+        "hostname": "",
+        "ip": None,
+    }
+
+
+def build_status_payload(source_label: str) -> dict[str, object]:
+    """Return the status payload expected by the Mission Control dashboard."""
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    return {
+        "requested_instance": "pi",
+        "resolved_instance": "pi",
+        "source_label": source_label,
+        "cpu_temp": get_cpu_temp(),
+        "cpu_usage": psutil.cpu_percent(interval=0.5),
+        "memory_used": memory.used,
+        "memory_total": memory.total,
+        "disk_used": disk.used,
+        "disk_total": disk.total,
+        "services": [
+            get_service_status("gateway", 8766),
+            get_service_status("matrixbridge", 8765),
+        ],
+        "tailscale": get_tailscale_status(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class PiStatusHandler(BaseHTTPRequestHandler):
+    """Serve minimal status endpoints."""
+
+    server_version = "HermesPiStatus/0.1"
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if parsed.path in {"/health", "/status/health"}:
+            self._write_json(HTTPStatus.OK, {"status": "healthy", "service": "hermes-pi-status"})
+            return
+        if parsed.path in {"/status", "/api/status"}:
+            if not self._authorize():
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+                return
+            payload = build_status_payload(self.server.source_label)  # type: ignore[attr-defined]
+            self._write_json(HTTPStatus.OK, payload)
+            return
+        if parsed.path in {"/digest", "/api/digest"}:
+            if not self._authorize():
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+                return
+            source_filter = (query.get("source", [""])[0] or "").strip() or None
+            days_raw = (query.get("days", [""])[0] or "").strip()
+            page_raw = (query.get("page", ["1"])[0] or "1").strip()
+            page_size_raw = (query.get("page_size", ["50"])[0] or "50").strip()
+            instance_filter = (query.get("instance", ["all"])[0] or "all").strip().lower()
+            try:
+                days = int(days_raw) if days_raw else None
+                page = max(1, int(page_raw))
+                page_size = max(1, min(250, int(page_size_raw)))
+            except ValueError:
+                self._write_json(HTTPStatus.BAD_REQUEST, {"detail": "Invalid digest query parameters"})
+                return
+            payload = build_digest_list_payload(
+                instance_filter=instance_filter,
+                source_filter=source_filter,
+                page=page,
+                page_size=page_size,
+                days=days,
+            )
+            self._write_json(HTTPStatus.OK, payload)
+            return
+        if parsed.path in {"/digest/stats", "/api/digest/stats"}:
+            if not self._authorize():
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+                return
+            instance_filter = (query.get("instance", ["all"])[0] or "all").strip().lower()
+            payload = build_digest_stats_payload(instance_filter=instance_filter)
+            self._write_json(HTTPStatus.OK, payload)
+            return
+        if parsed.path in {"/cron", "/api/cron"}:
+            if not self._authorize():
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+                return
+            instance_filter = (query.get("instance", ["all"])[0] or "all").strip().lower()
+            self._write_json(HTTPStatus.OK, build_cron_jobs_payload(instance_filter=instance_filter))
+            return
+        cron_logs_prefixes = ("/cron/", "/api/cron/")
+        if any(parsed.path.startswith(prefix) for prefix in cron_logs_prefixes) and parsed.path.endswith("/logs"):
+            if not self._authorize():
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+                return
+            job_id = parsed.path.split("/")[-2]
+            lines_raw = (query.get("lines", ["50"])[0] or "50").strip()
+            try:
+                lines = max(1, min(500, int(lines_raw)))
+                payload = build_job_logs_payload(job_id, lines=lines)
+            except ValueError:
+                self._write_json(HTTPStatus.BAD_REQUEST, {"detail": "Invalid log line count"})
+                return
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, {"detail": f"Job {job_id} not found"})
+                return
+            self._write_json(HTTPStatus.OK, payload)
+            return
+        digest_detail_prefixes = ("/digest/", "/api/digest/")
+        if any(parsed.path.startswith(prefix) for prefix in digest_detail_prefixes):
+            if not self._authorize():
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+                return
+            entry_id = parsed.path.rsplit("/", 1)[-1]
+            payload = build_digest_detail_payload(entry_id)
+            if payload is None:
+                self._write_json(HTTPStatus.NOT_FOUND, {"detail": f"Digest entry {entry_id} not found"})
+                return
+            self._write_json(HTTPStatus.OK, payload)
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"detail": "Not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if not self._authorize():
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+            return
+
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if len(segments) == 3 and segments[0] in {"cron", "api"}:
+            if segments[0] == "api":
+                if segments[1] != "cron":
+                    self._write_json(HTTPStatus.NOT_FOUND, {"detail": "Not found"})
+                    return
+                job_id, action = segments[2], ""
+            else:
+                job_id, action = segments[1], segments[2]
+        elif len(segments) == 4 and segments[:2] == ["api", "cron"]:
+            job_id, action = segments[2], segments[3]
+        else:
+            self._write_json(HTTPStatus.NOT_FOUND, {"detail": "Not found"})
+            return
+
+        if not action:
+            self._write_json(HTTPStatus.NOT_FOUND, {"detail": "Not found"})
+            return
+
+        try:
+            payload = _apply_cron_action(job_id, action)
+        except ValueError as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"detail": str(exc)})
+            return
+        except KeyError:
+            self._write_json(HTTPStatus.NOT_FOUND, {"detail": f"Job {job_id} not found"})
+            return
+        self._write_json(HTTPStatus.OK, payload)
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if not self._authorize():
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"detail": "Unauthorized"})
+            return
+
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if len(segments) == 2 and segments[0] == "cron":
+            job_id = segments[1]
+        elif len(segments) == 3 and segments[:2] == ["api", "cron"]:
+            job_id = segments[2]
+        else:
+            self._write_json(HTTPStatus.NOT_FOUND, {"detail": "Not found"})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"detail": "Invalid content length"})
+            return
+
+        try:
+            raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"detail": "Invalid JSON body"})
+            return
+
+        if not isinstance(payload, dict):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"detail": "Invalid JSON body"})
+            return
+
+        try:
+            result = apply_job_update(job_id, payload)
+        except KeyError:
+            self._write_json(HTTPStatus.NOT_FOUND, {"detail": f"Job {job_id} not found"})
+            return
+
+        self._write_json(HTTPStatus.OK, result)
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        return
+
+    def _authorize(self) -> bool:
+        expected = getattr(self.server, "bearer_token", "")  # type: ignore[attr-defined]
+        if not expected:
+            return True
+        actual = self.headers.get("Authorization", "").strip()
+        return actual == f"Bearer {expected}"
+
+    def _write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Minimal Pi status server for Hermes Mission Control")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8771, help="Port to bind to")
+    parser.add_argument("--bearer-token", default="", help="Optional bearer token required for /status")
+    parser.add_argument("--source-label", default="PI lightweight agent", help="Label returned in status payload")
+    args = parser.parse_args()
+
+    server = ThreadingHTTPServer((args.host, args.port), PiStatusHandler)
+    server.bearer_token = args.bearer_token  # type: ignore[attr-defined]
+    server.source_label = args.source_label  # type: ignore[attr-defined]
+    print(f"Hermes Pi status server listening on http://{args.host}:{args.port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""Manage Mission Control API as a systemd user service.
+
+Usage:
+  ./scripts/hermes-mission-control run
+  ./scripts/hermes-mission-control install [--start]
+  ./scripts/hermes-mission-control sync-env
+  ./scripts/hermes-mission-control start|stop|restart|status
+  ./scripts/hermes-mission-control audit [--runtime]
+  ./scripts/hermes-mission-control uninstall
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import subprocess
+import sys
+import shutil
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+MISSION_CONTROL_DIR = PROJECT_DIR / "mission-control-api"
+START_SCRIPT = MISSION_CONTROL_DIR / "start.py"
+SERVICE_NAME = "hermes-mission-control"
+SERVICE_DESCRIPTION = "Hermes Mission Control API (Web View + memory ingest)"
+SYSTEMD_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service"
+ENV_FILE_PATH = Path.home() / ".config" / "hermes" / "mission-control.env"
+ENV_TEMPLATE_PATH = MISSION_CONTROL_DIR / "deploy" / "mission-control.env.example"
+
+FRONTEND_DIR = MISSION_CONTROL_DIR / "frontend"
+STATIC_DIR = MISSION_CONTROL_DIR / "app" / "web" / "static"
+STATIC_INDEX = STATIC_DIR / "index.html"
+STATIC_CSS = STATIC_DIR / "css" / "dashboard.css"
+STATIC_JS = STATIC_DIR / "js" / "dashboard.js"
+SYNC_RUNTIME_ENV_SCRIPT = PROJECT_DIR / "scripts" / "sync_runtime_env.py"
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = "8767"
+PLACEHOLDER_SECRETS = {
+    "",
+    "replace-with-strong-random-token",
+    "replace-with-strong-random-value",
+    "replace-with-shared-hmac-secret",
+    "replace-with-shared-ingest-secret",
+}
+EXPECTED_ENV_EXACT = {
+    "ENVIRONMENT": "production",
+    "AUTH_MODE": "all",
+    "DASHBOARD_AUTH_MODE": "cloudflare",
+    "MEMORY_INGEST_BACKEND": "hindsight",
+}
+
+
+def _require_linux() -> None:
+    if platform.system().lower() != "linux":
+        raise RuntimeError("systemd service management is only supported on Linux")
+
+
+def _python_path() -> str:
+    candidates = [
+        MISSION_CONTROL_DIR / ".venv" / "bin" / "python",
+        PROJECT_DIR / "venv" / "bin" / "python",
+        Path(sys.executable),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
+def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        check=check,
+        text=True,
+        capture_output=False,
+    )
+
+
+def _npm_command() -> tuple[list[str], dict[str, str] | None]:
+    search_paths = [
+        Path.home() / ".local" / "share" / "fnm" / "node-versions" / "v24.11.1" / "installation" / "bin" / "npm",
+        Path.home() / ".local" / "share" / "fnm" / "current" / "bin" / "npm",
+        Path.home() / ".fnm" / "current" / "bin" / "npm",
+        Path.home() / ".local" / "share" / "pnpm" / "pnpm",
+        Path.home() / ".local" / "bin" / "pnpm",
+    ]
+    for candidate in search_paths:
+        if candidate.exists() and candidate.is_file():
+            env = None
+            if candidate.name == "npm":
+                env = dict(os.environ)
+                bin_dir = str(candidate.parent)
+                env["PATH"] = f"{bin_dir}:{env.get('PATH', '/usr/bin:/bin')}"
+            return [str(candidate)], env
+    for candidate in ("npm", "pnpm"):
+        path = shutil.which(candidate)
+        if path:
+            env = None
+            if Path(path).name == "npm":
+                env = dict(os.environ)
+                bin_dir = str(Path(path).parent)
+                env["PATH"] = f"{bin_dir}:{env.get('PATH', '/usr/bin:/bin')}"
+            return [path], env
+    raise RuntimeError(
+        "Mission Control frontend build requires npm or pnpm; checked PATH and common home install locations"
+    )
+
+
+def _frontend_build_inputs() -> list[Path]:
+    inputs = [
+        FRONTEND_DIR / "package.json",
+        FRONTEND_DIR / "package-lock.json",
+        FRONTEND_DIR / "vite.config.ts",
+        FRONTEND_DIR / "index.html",
+    ]
+    for subdir in ("src", "public"):
+        root = FRONTEND_DIR / subdir
+        if root.exists():
+            inputs.extend(path for path in root.rglob("*") if path.is_file())
+    return inputs
+
+
+def _frontend_build_required() -> bool:
+    required_outputs = (STATIC_INDEX, STATIC_CSS, STATIC_JS)
+    if any(not path.exists() for path in required_outputs):
+        return True
+
+    newest_input = max(path.stat().st_mtime for path in _frontend_build_inputs() if path.exists())
+    oldest_output = min(path.stat().st_mtime for path in required_outputs)
+    return newest_input > oldest_output
+
+
+def _ensure_frontend_build(force: bool = False) -> None:
+    if not FRONTEND_DIR.exists():
+        raise RuntimeError(f"Mission Control frontend directory is missing: {FRONTEND_DIR}")
+
+    if not force and not _frontend_build_required():
+        return
+
+    cmd_base, env = _npm_command()
+    cmd = cmd_base + ["run", "build"]
+    print("Ensuring Mission Control dashboard assets are built...")
+    subprocess.run(cmd, cwd=FRONTEND_DIR, check=True, env=env)
+
+
+def _sync_runtime_env() -> None:
+    python_path = _python_path()
+    subprocess.run(
+        [python_path, str(SYNC_RUNTIME_ENV_SCRIPT), "--mission-control", "--lan-proxies"],
+        cwd=PROJECT_DIR,
+        check=True,
+    )
+
+
+def _generate_unit() -> str:
+    python_path = _python_path()
+    return f"""[Unit]
+Description={SERVICE_DESCRIPTION}
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory={MISSION_CONTROL_DIR}
+EnvironmentFile=-{ENV_FILE_PATH}
+Environment=PYTHONUNBUFFERED=1
+Environment=MC_HOST={DEFAULT_HOST}
+Environment=MC_PORT={DEFAULT_PORT}
+Environment=HERMES_HOME=%h/.hermes
+ExecStartPre={python_path} {SYNC_RUNTIME_ENV_SCRIPT} --mission-control
+ExecStartPre={python_path} {SCRIPT_DIR / "hermes-mission-control"} build-assets
+ExecStart={python_path} {START_SCRIPT} --host ${{MC_HOST}} --port ${{MC_PORT}}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _read_env_value(key: str) -> str:
+    if not ENV_FILE_PATH.exists():
+        return ""
+    prefix = f"{key}="
+    for raw_line in ENV_FILE_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith(prefix):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _parse_json_string_list(key: str, raw_value: str) -> tuple[list[str] | None, str | None]:
+    value = raw_value.strip()
+    if not value:
+        return None, f"{key} must be set to a JSON string array"
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        return None, f"{key} is not valid JSON: {exc.msg}"
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        return None, f"{key} must be a JSON string array"
+    return [item.strip() for item in parsed if item.strip()], None
+
+
+def _parse_bool_value(key: str, raw_value: str) -> tuple[bool | None, str | None]:
+    value = raw_value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True, None
+    if value in {"0", "false", "no", "off"}:
+        return False, None
+    return None, f"{key} must be true/false"
+
+
+def _is_local_only_host(raw_host: str) -> bool:
+    host = raw_host.strip().lower()
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _collect_env_hardening_findings() -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not ENV_FILE_PATH.exists():
+        errors.append(f"Missing env file: {ENV_FILE_PATH}")
+        return errors, warnings
+
+    env_mode = ENV_FILE_PATH.stat().st_mode & 0o777
+    if env_mode != 0o600:
+        errors.append(f"{ENV_FILE_PATH} must have mode 600 (current: {oct(env_mode)})")
+
+    for key, expected in EXPECTED_ENV_EXACT.items():
+        actual = _read_env_value(key).strip().lower()
+        if actual != expected:
+            errors.append(f"{key} must be '{expected}' (current: '{actual or '<unset>'}')")
+
+    bearer = _read_env_value("BEARER_TOKEN").strip()
+    if bearer in PLACEHOLDER_SECRETS:
+        errors.append(f"BEARER_TOKEN must be set to a strong random value in {ENV_FILE_PATH}")
+
+    ingest_secret = _read_env_value("MEMORY_INGEST_HMAC_SECRET").strip()
+    if ingest_secret in PLACEHOLDER_SECRETS:
+        errors.append(f"MEMORY_INGEST_HMAC_SECRET must be set to a real shared secret in {ENV_FILE_PATH}")
+
+    dashboard_mode = _read_env_value("DASHBOARD_AUTH_MODE").strip().lower() or "public"
+    mc_host = _read_env_value("MC_HOST").strip() or DEFAULT_HOST
+    dashboard_secret = _read_env_value("DASHBOARD_SHARED_SECRET").strip()
+    if dashboard_mode == "cloudflare" and dashboard_secret in {"", "replace-with-dashboard-origin-secret"}:
+        if _is_local_only_host(mc_host):
+            warnings.append(
+                "DASHBOARD_SHARED_SECRET is unset while DASHBOARD_AUTH_MODE=cloudflare; "
+                f"accepted because MC_HOST={mc_host!r} is localhost-only"
+            )
+        else:
+            errors.append(
+                "DASHBOARD_SHARED_SECRET must be set when DASHBOARD_AUTH_MODE=cloudflare "
+                f"unless MC_HOST is localhost-only ({ENV_FILE_PATH}, current MC_HOST={mc_host!r})"
+            )
+
+    expose_docs_raw = _read_env_value("EXPOSE_DOCS")
+    expose_docs, expose_docs_error = _parse_bool_value("EXPOSE_DOCS", expose_docs_raw)
+    if expose_docs_error:
+        errors.append(expose_docs_error)
+    elif expose_docs:
+        errors.append("EXPOSE_DOCS must be false in production")
+
+    cors_origins_raw = _read_env_value("CORS_ORIGINS")
+    cors_origins, cors_error = _parse_json_string_list("CORS_ORIGINS", cors_origins_raw)
+    if cors_error:
+        errors.append(cors_error)
+    elif not cors_origins:
+        errors.append("CORS_ORIGINS must contain at least one explicit origin")
+    else:
+        if any(origin == "*" for origin in cors_origins):
+            errors.append("CORS_ORIGINS cannot contain wildcard '*' in production")
+        for origin in cors_origins:
+            if not origin.startswith("https://"):
+                warnings.append(f"CORS_ORIGINS contains non-HTTPS origin: {origin}")
+
+    allowed_sources_raw = _read_env_value("MEMORY_INGEST_ALLOWED_SOURCES")
+    allowed_sources, allowed_error = _parse_json_string_list("MEMORY_INGEST_ALLOWED_SOURCES", allowed_sources_raw)
+    if allowed_error:
+        errors.append(allowed_error)
+    elif not allowed_sources:
+        errors.append("MEMORY_INGEST_ALLOWED_SOURCES must contain at least one source IP")
+    elif any(source in {"*", "0.0.0.0/0", "::/0"} for source in allowed_sources):
+        errors.append("MEMORY_INGEST_ALLOWED_SOURCES must not allow wildcard/global sources")
+
+    return errors, warnings
+
+
+def _validate_env_for_start() -> None:
+    errors, _warnings = _collect_env_hardening_findings()
+    if errors:
+        formatted = "\n  - ".join([""] + errors)
+        raise RuntimeError(f"Refusing to start service due to failed hardening checks:{formatted}")
+
+
+def _http_get(url: str, headers: dict[str, str] | None = None) -> tuple[int, str]:
+    req = urllib_request.Request(url, method="GET")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib_request.urlopen(req, timeout=5) as response:
+            return response.status, response.read().decode("utf-8", errors="replace")
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return exc.code, body
+
+
+def _runtime_hardening_checks() -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    port = _read_env_value("MC_PORT").strip() or DEFAULT_PORT
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        status, _ = _http_get(f"{base_url}/api/status/health")
+    except urllib_error.URLError as exc:
+        errors.append(f"Cannot reach Mission Control at {base_url}: {exc}")
+        return errors, warnings
+    if status != 200:
+        errors.append(f"Expected /api/status/health to return 200, got {status}")
+
+    dashboard_mode = _read_env_value("DASHBOARD_AUTH_MODE").strip().lower() or "public"
+    if dashboard_mode == "cloudflare":
+        try:
+            dashboard_status, _ = _http_get(f"{base_url}/dashboard")
+        except urllib_error.URLError as exc:
+            errors.append(f"Could not verify /dashboard Cloudflare gate at {base_url}: {exc}")
+            return errors, warnings
+        if dashboard_status != 401:
+            errors.append(f"Expected /dashboard without Cloudflare headers to return 401, got {dashboard_status}")
+
+        try:
+            static_status, _ = _http_get(f"{base_url}/static/js/dashboard.js")
+        except urllib_error.URLError as exc:
+            errors.append(f"Could not verify /static Cloudflare gate at {base_url}: {exc}")
+            return errors, warnings
+        if static_status != 401:
+            errors.append(
+                f"Expected /static/js/dashboard.js without Cloudflare headers to return 401, got {static_status}"
+            )
+    else:
+        warnings.append("Skipping dashboard 401 checks because DASHBOARD_AUTH_MODE is not 'cloudflare'")
+
+    bearer = _read_env_value("BEARER_TOKEN").strip()
+    if bearer in PLACEHOLDER_SECRETS:
+        warnings.append("Skipping ingest health auth check: BEARER_TOKEN is unset/placeholder")
+        return errors, warnings
+
+    try:
+        health_status, health_body = _http_get(
+            f"{base_url}/api/memory/ingest/health",
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+    except urllib_error.URLError as exc:
+        errors.append(f"Could not verify ingest health endpoint at {base_url}: {exc}")
+        return errors, warnings
+    if health_status != 200:
+        errors.append(f"Expected /api/memory/ingest/health with bearer auth to return 200, got {health_status}")
+        return errors, warnings
+
+    try:
+        payload = json.loads(health_body)
+    except json.JSONDecodeError as exc:
+        errors.append(f"/api/memory/ingest/health returned invalid JSON: {exc.msg}")
+        return errors, warnings
+
+    backend = str(payload.get("backend", "")).strip().lower()
+    ok = bool(payload.get("ok"))
+    if backend != "hindsight" or not ok:
+        errors.append(
+            "/api/memory/ingest/health must report backend='hindsight' and ok=true"
+            f" (got backend='{backend or '<unset>'}', ok={ok})"
+        )
+
+    return errors, warnings
+
+
+def audit_hardening(check_runtime: bool = False) -> int:
+    env_errors, env_warnings = _collect_env_hardening_findings()
+
+    runtime_errors: list[str] = []
+    runtime_warnings: list[str] = []
+    if check_runtime:
+        runtime_errors, runtime_warnings = _runtime_hardening_checks()
+
+    all_errors = [*env_errors, *runtime_errors]
+    all_warnings = [*env_warnings, *runtime_warnings]
+
+    print("DIM-241 hardening audit")
+    if check_runtime:
+        print("Mode: config + runtime checks")
+    else:
+        print("Mode: config checks only")
+
+    if all_errors:
+        print("Result: FAIL")
+        for issue in all_errors:
+            print(f"  [error] {issue}")
+    else:
+        print("Result: PASS")
+
+    for warning in all_warnings:
+        print(f"  [warn] {warning}")
+
+    return 1 if all_errors else 0
+
+
+def _ensure_env_template() -> None:
+    if ENV_FILE_PATH.exists():
+        return
+    ENV_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if ENV_TEMPLATE_PATH.exists():
+        ENV_FILE_PATH.write_text(ENV_TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        ENV_FILE_PATH.write_text(
+            "\n".join(
+                [
+                    "# Mission Control API environment file",
+                    "ENVIRONMENT=production",
+                    "AUTH_MODE=all",
+                    "BEARER_TOKEN=replace-with-strong-random-value",
+                    'CORS_ORIGINS=["https://your-hermes-web-domain.example"]',
+                    "MC_HOST=127.0.0.1",
+                    "DASHBOARD_AUTH_MODE=cloudflare",
+                    "DASHBOARD_SHARED_SECRET=replace-with-dashboard-origin-secret",
+                    "MEMORY_INGEST_BACKEND=hindsight",
+                    "MEMORY_INGEST_HMAC_SECRET=replace-with-shared-ingest-secret",
+                    'MEMORY_INGEST_ALLOWED_SOURCES=["100.67.97.50"]',
+                    "MEMORY_INGEST_HINDSIGHT_BASE_URL=http://127.0.0.1:9177",
+                    "MEMORY_INGEST_HINDSIGHT_BANK=hermes",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    ENV_FILE_PATH.chmod(0o600)
+    print(f"Created env template at {ENV_FILE_PATH} (permissions: 600)")
+
+
+def install_service(start_after_install: bool = False) -> None:
+    _sync_runtime_env()
+    _ensure_frontend_build()
+    _require_linux()
+    if not START_SCRIPT.exists():
+        raise RuntimeError(f"Cannot find Mission Control start script: {START_SCRIPT}")
+
+    _ensure_env_template()
+    SYSTEMD_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEMD_UNIT_PATH.write_text(_generate_unit(), encoding="utf-8")
+    print(f"Installed systemd unit: {SYSTEMD_UNIT_PATH}")
+
+    _run_systemctl("daemon-reload")
+    _run_systemctl("enable", SERVICE_NAME)
+    print(f"Enabled autostart for {SERVICE_NAME}")
+
+    if start_after_install:
+        _validate_env_for_start()
+        _run_systemctl("start", SERVICE_NAME)
+        print(f"Started {SERVICE_NAME}")
+
+    print(f"View logs with: journalctl --user -u {SERVICE_NAME} -f")
+    print("If service should survive logout, enable linger once:")
+    print("  sudo loginctl enable-linger $USER")
+
+
+def uninstall_service() -> None:
+    _require_linux()
+    _run_systemctl("stop", SERVICE_NAME, check=False)
+    _run_systemctl("disable", SERVICE_NAME, check=False)
+    if SYSTEMD_UNIT_PATH.exists():
+        SYSTEMD_UNIT_PATH.unlink()
+        print(f"Removed {SYSTEMD_UNIT_PATH}")
+    _run_systemctl("daemon-reload")
+
+
+def start_service() -> None:
+    _require_linux()
+    _sync_runtime_env()
+    _validate_env_for_start()
+    _ensure_frontend_build()
+    _run_systemctl("start", SERVICE_NAME)
+    print(f"Started {SERVICE_NAME}")
+
+
+def stop_service() -> None:
+    _require_linux()
+    _run_systemctl("stop", SERVICE_NAME)
+    print(f"Stopped {SERVICE_NAME}")
+
+
+def restart_service() -> None:
+    _require_linux()
+    _sync_runtime_env()
+    _validate_env_for_start()
+    _ensure_frontend_build()
+    _run_systemctl("restart", SERVICE_NAME)
+    print(f"Restarted {SERVICE_NAME}")
+
+
+def status_service() -> None:
+    _require_linux()
+    _run_systemctl("status", SERVICE_NAME, check=False)
+
+
+def run_foreground() -> None:
+    _sync_runtime_env()
+    _ensure_frontend_build()
+    python_path = _python_path()
+    host = DEFAULT_HOST
+    port = DEFAULT_PORT
+    subprocess.run(
+        [python_path, str(START_SCRIPT), "--host", host, "--port", port],
+        cwd=MISSION_CONTROL_DIR,
+        check=True,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Hermes Mission Control service manager")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=["run", "install", "uninstall", "start", "stop", "restart", "status", "print-unit", "audit", "build-assets", "sync-env"],
+        help="Command to execute",
+    )
+    parser.add_argument(
+        "--start",
+        action="store_true",
+        help="Start the service immediately after install",
+    )
+    parser.add_argument(
+        "--runtime",
+        action="store_true",
+        help="With audit command, run live HTTP checks against local Mission Control service",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    try:
+        if args.command == "run":
+            run_foreground()
+        elif args.command == "install":
+            install_service(start_after_install=args.start)
+        elif args.command == "uninstall":
+            uninstall_service()
+        elif args.command == "start":
+            start_service()
+        elif args.command == "stop":
+            stop_service()
+        elif args.command == "restart":
+            restart_service()
+        elif args.command == "status":
+            status_service()
+        elif args.command == "print-unit":
+            print(_generate_unit())
+        elif args.command == "audit":
+            return audit_hardening(check_runtime=args.runtime)
+        elif args.command == "build-assets":
+            _ensure_frontend_build(force=True)
+        elif args.command == "sync-env":
+            _sync_runtime_env()
+            print(f"Synced runtime env files from {Path.home() / '.hermes' / '.env'}")
+        else:  # pragma: no cover - argparse handles choices
+            raise RuntimeError(f"Unsupported command: {args.command}")
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
