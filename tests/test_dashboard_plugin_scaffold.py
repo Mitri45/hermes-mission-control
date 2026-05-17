@@ -42,8 +42,77 @@ def test_mission_control_plugin_api_health():
     assert response.json() == {
         "status": "ok",
         "plugin": "mission-control",
-        "version": "0.1.0",
+        "version": "0.6.0",
     }
+
+    fleet_response = client.get("/api/plugins/mission-control/fleet/status")
+    assert fleet_response.status_code == 200
+    fleet = fleet_response.json()
+    assert set(fleet["instances"]) == {"pc", "pi"}
+    assert "generated_at" in fleet
+    assert fleet["instances"]["pc"]["ok"] in {True, False}
+
+    hindsight_health_response = client.get("/api/plugins/mission-control/hindsight/health")
+    assert hindsight_health_response.status_code == 200
+    hindsight_health = hindsight_health_response.json()
+    assert hindsight_health["backend"] == "hindsight"
+    assert hindsight_health["bank_id"]
+
+    hindsight_facts_response = client.get("/api/plugins/mission-control/hindsight/facts?limit=5")
+    assert hindsight_facts_response.status_code in {200, 500}
+    if hindsight_facts_response.status_code == 200:
+        hindsight_facts = hindsight_facts_response.json()
+        assert "items" in hindsight_facts
+        assert "total" in hindsight_facts
+
+    provider_status_response = client.get("/api/plugins/mission-control/providers/status")
+    assert provider_status_response.status_code == 200
+    provider_status = provider_status_response.json()
+    assert "providers" in provider_status
+    assert "summary" in provider_status
+
+    memory_ingest_response = client.get("/api/plugins/mission-control/memory-ingest/metrics")
+    assert memory_ingest_response.status_code == 200
+    memory_ingest = memory_ingest_response.json()
+    assert "checkpoints" in memory_ingest
+    assert "totals" in memory_ingest
+    assert "dead_letters" in memory_ingest
+
+    digest_stats_response = client.get("/api/plugins/mission-control/digest/stats")
+    assert digest_stats_response.status_code == 200
+    digest_stats = digest_stats_response.json()
+    assert "total_entries" in digest_stats
+    assert "by_source" in digest_stats
+
+    digest_list_response = client.get("/api/plugins/mission-control/digest?page=1&page_size=5")
+    assert digest_list_response.status_code == 200
+    digest_list = digest_list_response.json()
+    assert "entries" in digest_list
+    assert "groups" in digest_list
+
+    harness_status_response = client.get("/api/plugins/mission-control/harness/status")
+    assert harness_status_response.status_code == 200
+    harness_status = harness_status_response.json()
+    assert "webhook" in harness_status
+    assert "config" in harness_status
+
+    harness_sessions_response = client.get("/api/plugins/mission-control/harness/sessions")
+    assert harness_sessions_response.status_code == 200
+    assert "sessions" in harness_sessions_response.json()
+
+    operations_recent_response = client.get("/api/plugins/mission-control/operations/recent?limit=5")
+    assert operations_recent_response.status_code == 200
+    assert "events" in operations_recent_response.json()
+
+
+def test_mission_control_cutover_document_exists():
+    doc = Path(__file__).resolve().parents[1] / "docs" / "consolidation" / "dashboard-cutover.md"
+    content = doc.read_text(encoding="utf-8")
+    assert "Fleet Health" in content
+    assert "Hindsight Bank" in content
+    assert "Provider Status" in content
+    assert "upstream `hermes dashboard`" in content
+    assert "No secrets" in content
 
 
 def test_mission_control_plugin_dist_assets_exist():
@@ -53,3 +122,9 @@ def test_mission_control_plugin_dist_assets_exist():
     assert "__HERMES_PLUGIN_SDK__" in bundle
     assert "mission-control" in bundle
     assert "/api/plugins/mission-control" in bundle
+    assert "Hindsight Bank" in bundle
+    assert "Provider Status" in bundle
+    assert "Memory Ingest" in bundle
+    assert "Daily Digest" in bundle
+    assert "Linear Harness" in bundle
+    assert "Recent Operations" in bundle

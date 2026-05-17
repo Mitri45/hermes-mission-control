@@ -34,6 +34,7 @@ venv/
 poetry.lock
 *.lock
 !uv.lock
+!plugins/mission-control/dashboard/package-lock.json
 
 # Generated frontend bundle artifacts (built from frontend/)
 app/web/static/css/dashboard.css

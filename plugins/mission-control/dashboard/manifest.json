@@ -3,7 +3,7 @@
   "label": "Mission Control",
   "description": "Ops cockpit for Dima's Hermes deployment: fleet health, Hindsight, Linear harness, digest, provider status, and operations stream.",
   "icon": "Activity",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "tab": {
     "path": "/mission-control",
     "position": "after:plugins"

@@ -1,4 +1,4 @@
-import type { MissionControlHealth, MissionControlSummary } from './types'
+import type { FleetStatusResponse, HindsightBankStatsResponse, HindsightFactsResponse, HindsightHealthResponse, HindsightSource, HindsightStaleFactsResponse, MissionControlHealth, MissionControlSummary, ProviderStatusResponse, MemoryIngestHealthResponse, MemoryIngestMetricsResponse, DeadLetterResponse, DigestListResponse, DigestStatsResponse, HarnessStatusResponse, SessionsResponse, WorkersResponse, OperationsRecentResponse } from './types'
 
 const API_PREFIX = '/api/plugins/mission-control'
 
@@ -32,4 +32,30 @@ export function missionControlWsUrl(path: string): string {
 export const missionControlApi = {
   health: () => mcFetch<MissionControlHealth>('/health'),
   summary: () => mcFetch<MissionControlSummary>('/summary'),
+  fleetStatus: () => mcFetch<FleetStatusResponse>('/fleet/status'),
+  hindsightHealth: () => mcFetch<HindsightHealthResponse>('/hindsight/health'),
+  hindsightStats: (source: HindsightSource = 'all') => mcFetch<HindsightBankStatsResponse>(`/hindsight/stats?source=${encodeURIComponent(source)}`),
+  hindsightFacts: (params: { q?: string; context?: string; source?: HindsightSource; stale_only?: boolean; sort?: 'newest' | 'oldest'; limit?: number; offset?: number } = {}) => {
+    const search = new URLSearchParams()
+    if (params.q) search.set('q', params.q)
+    if (params.context) search.set('context', params.context)
+    search.set('source', params.source ?? 'all')
+    if (params.stale_only) search.set('stale_only', 'true')
+    search.set('sort', params.sort ?? 'newest')
+    search.set('limit', String(params.limit ?? 25))
+    search.set('offset', String(params.offset ?? 0))
+    return mcFetch<HindsightFactsResponse>(`/hindsight/facts?${search.toString()}`)
+  },
+  hindsightStale: (source: HindsightSource = 'all') => mcFetch<HindsightStaleFactsResponse>(`/hindsight/stale?source=${encodeURIComponent(source)}`),
+  providerStatus: () => mcFetch<ProviderStatusResponse>('/providers/status'),
+  memoryIngestHealth: () => mcFetch<MemoryIngestHealthResponse>('/memory-ingest/health'),
+  memoryIngestMetrics: () => mcFetch<MemoryIngestMetricsResponse>('/memory-ingest/metrics'),
+  memoryIngestDeadLetters: () => mcFetch<DeadLetterResponse>('/memory-ingest/dead-letter?limit=8'),
+  digestStats: () => mcFetch<DigestStatsResponse>('/digest/stats'),
+  digestList: () => mcFetch<DigestListResponse>('/digest?page=1&page_size=8&days=30'),
+  harnessStatus: () => mcFetch<HarnessStatusResponse>('/harness/status'),
+  harnessSessions: () => mcFetch<SessionsResponse>('/harness/sessions'),
+  harnessWorkers: () => mcFetch<WorkersResponse>('/harness/workers'),
+  operationsRecent: () => mcFetch<OperationsRecentResponse>('/operations/recent?limit=20'),
 }
+
