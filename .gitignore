@@ -41,6 +41,11 @@ app/web/static/js/dashboard.js
 app/web/static/assets/*
 app/web/static/brand/*
 
+# Hermes dashboard plugins are installed directly from this repo; keep their
+# built browser assets tracked so a clone can be installed without rebuilding.
+!plugins/mission-control/dashboard/dist/
+!plugins/mission-control/dashboard/dist/*
+
 # Keep frontend source modules tracked (overrides generic `lib/` ignore above)
 !frontend/src/lib/
 !frontend/src/lib/*
