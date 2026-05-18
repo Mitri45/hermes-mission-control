@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,8 +12,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
 def plugin_root() -> Path:
-    return Path(__file__).resolve().parents[1] / "plugins" / "mission-control" / "dashboard"
+    return repo_root() / "plugins" / "mission-control" / "dashboard"
 
 
 def test_mission_control_plugin_manifest():
@@ -106,7 +111,7 @@ def test_mission_control_plugin_api_health():
 
 
 def test_mission_control_cutover_document_exists():
-    doc = Path(__file__).resolve().parents[1] / "docs" / "consolidation" / "dashboard-cutover.md"
+    doc = repo_root() / "docs" / "consolidation" / "dashboard-cutover.md"
     content = doc.read_text(encoding="utf-8")
     assert "Fleet Health" in content
     assert "Hindsight Bank" in content
@@ -128,3 +133,42 @@ def test_mission_control_plugin_dist_assets_exist():
     assert "Daily Digest" in bundle
     assert "Linear Harness" in bundle
     assert "Recent Operations" in bundle
+
+
+def test_readable_dashboard_theme_is_packaged():
+    theme = repo_root() / "themes" / "dima-readable.yaml"
+    content = theme.read_text(encoding="utf-8")
+    assert "name: dima-readable" in content
+    assert "label: Dima Readable" in content
+    assert "fontSans:" in content
+    assert "customCSS: |" in content
+    assert "font-mondwest" in content
+    assert "font-expanded" in content
+    assert "var(--theme-font-sans)" in content
+
+
+def test_installer_deploys_plugin_and_theme(tmp_path):
+    hermes_repo = tmp_path / "hermes-agent"
+    (hermes_repo / "hermes_cli").mkdir(parents=True)
+    theme_dir = tmp_path / "dashboard-themes"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root() / "scripts" / "install_dashboard_plugin.py"),
+            "--hermes-repo",
+            str(hermes_repo),
+            "--theme-dir",
+            str(theme_dir),
+            "--skip-theme-activation",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert (hermes_repo / "plugins" / "mission-control" / "dashboard" / "manifest.json").is_file()
+    assert (hermes_repo / "plugins" / "mission-control" / "dashboard" / "dist" / "index.js").is_file()
+    assert (theme_dir / "dima-readable.yaml").is_file()
+    assert "Installed Mission Control dashboard plugin" in result.stdout
+    assert "Installed readable dashboard theme" in result.stdout
